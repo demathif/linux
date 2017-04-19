@@ -783,6 +783,144 @@ static int fat_ioctl_readdir(struct inode *inode, struct file *file,
 	return ret;
 }
 
+/*
+ * Scans a directory for an ATTR_VOLUME
+ * Returns an error code or zero.
+ */
+static int fat_find_volume_label(struct inode *dir,
+				 struct fat_slot_info *sinfo)
+{
+	struct super_block *sb  = dir->i_sb;
+
+	sinfo->slot_off = 0;
+	sinfo->bh = NULL;
+	while (fat_get_entry(dir, &sinfo->slot_off, &sinfo->bh,
+				   &sinfo->de) >= 0) {
+		if (sinfo->de->attr & ATTR_VOLUME) {
+			sinfo->slot_off -= sizeof(*sinfo->de);
+			sinfo->nr_slots = 1;
+			sinfo->i_pos = fat_make_i_pos(sb, sinfo->bh, sinfo->de);
+			fat_msg(sb, KERN_INFO, "%s: %s", __func__,
+					sinfo->de->name);
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+/***** Creates a volume label entry */
+static int msdos_add_volume_label(struct inode *dir, const unsigned char *name,
+			   struct timespec *ts, struct fat_slot_info *sinfo)
+{
+	struct msdos_sb_info *sbi = MSDOS_SB(dir->i_sb);
+	struct super_block *sb = dir->i_sb;
+	struct msdos_dir_entry de;
+	__le16 time, date;
+	int err;
+
+	fat_msg(sb, KERN_INFO, "%s: %s", __func__, name);
+	memcpy(de.name, name, MSDOS_NAME);
+	de.attr = ATTR_VOLUME;
+	de.lcase = 0;
+	fat_time_unix2fat(sbi, ts, &time, &date, NULL);
+	de.cdate = de.adate = 0;
+	de.ctime = 0;
+	de.ctime_cs = 0;
+	de.time = time;
+	de.date = date;
+	fat_set_start(&de, 0);
+	de.size = 0;
+
+	err = fat_add_entries(dir, &de, 1, sinfo);
+	if (err)
+		return err;
+
+	return 0;
+}
+
+/***** Update a volume label entry */
+static int msdos_update_volume_label(struct inode *dir,
+		const unsigned char *name,
+		struct timespec *ts, struct fat_slot_info *sinfo)
+{
+	struct msdos_sb_info *sbi = MSDOS_SB(dir->i_sb);
+	struct super_block *sb = dir->i_sb;
+	struct inode *inode;
+	__le16 time, date;
+
+	fat_msg(sb, KERN_INFO, "%s: %s\n", __func__, name);
+	fat_time_unix2fat(sbi, ts, &time, &date, NULL);
+	memcpy(sinfo->de->name, name, MSDOS_NAME);
+	inode = fat_build_inode(sb, sinfo->de, sinfo->i_pos);
+	inode->i_atime = inode->i_mtime = *ts;
+	mark_inode_dirty(inode);
+	iput(inode);
+	return 0;
+}
+
+static int fat_ioctl_set_volume_label(struct file *filp, unsigned long arg)
+{
+	struct inode *inode = file_inode(filp);
+	struct inode *dir = inode->i_sb->s_root->d_inode;
+	struct super_block *sb = dir->i_sb;
+	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+	struct fat_slot_info sinfo;
+	struct timespec ts;
+	unsigned char label[MSDOS_NAME];
+
+	struct buffer_head *bh;
+	struct fat_boot_sector *b;
+
+	if (copy_from_user(label, (unsigned char *)arg, MSDOS_NAME))
+		return -EFAULT;
+
+	/* volume label exists? */
+	if (!fat_find_volume_label(dir, &sinfo)) {
+		mutex_lock(&sbi->s_lock);
+		msdos_update_volume_label(dir, label, &ts, &sinfo);
+		mutex_unlock(&sbi->s_lock);
+	} else { /* else create it */
+		mutex_lock(&sbi->s_lock);
+		msdos_add_volume_label(dir, label, &ts, &sinfo);
+		mutex_unlock(&sbi->s_lock);
+	}
+
+	dir->i_ctime = dir->i_mtime = ts;
+	if (IS_DIRSYNC(dir))
+		(void)fat_sync_inode(dir);
+	else
+		mark_inode_dirty(dir);
+
+	if (sb->s_flags & MS_RDONLY) {
+		fat_msg(sb, KERN_WARNING, "RDONLY file system");
+		return -ENOTTY;
+	}
+
+	if (sbi->dirty) {
+		fat_msg(sb, KERN_WARNING, "DIRTY, Some data may be corrupt");
+		return -ENOTTY;
+	}
+
+	bh = sb_bread(sb, 0);
+	if (bh == NULL) {
+		fat_msg(sb, KERN_ERR, "unable to read boot sector");
+		return -ENOTTY;
+	}
+
+	b = (struct fat_boot_sector *) bh->b_data;
+
+	if (sbi->fat_bits == 32)
+		memcpy(b->fat32.vol_label, label, MSDOS_NAME);
+	else
+		memcpy(b->fat16.vol_label, label, MSDOS_NAME);
+
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	return 0;
+}
+
 static long fat_dir_ioctl(struct file *filp, unsigned int cmd,
 			  unsigned long arg)
 {
@@ -799,6 +937,8 @@ static long fat_dir_ioctl(struct file *filp, unsigned int cmd,
 		short_only = 0;
 		both = 1;
 		break;
+	case FAT_IOCTL_SET_VOLUME_LABEL:
+		return fat_ioctl_set_volume_label(filp, arg);
 	default:
 		return fat_generic_ioctl(filp, cmd, arg);
 	}
@@ -820,6 +960,7 @@ static long fat_dir_ioctl(struct file *filp, unsigned int cmd,
 #ifdef CONFIG_COMPAT
 #define	VFAT_IOCTL_READDIR_BOTH32	_IOR('r', 1, struct compat_dirent[2])
 #define	VFAT_IOCTL_READDIR_SHORT32	_IOR('r', 2, struct compat_dirent[2])
+#define FAT_IOCTL_SET_VOLUME_LABEL32	_IOW('r', 0x14, char *)
 
 FAT_IOCTL_FILLDIR_FUNC(fat_compat_ioctl_filldir, compat_dirent)
 
@@ -839,6 +980,8 @@ static long fat_compat_dir_ioctl(struct file *filp, unsigned cmd,
 		short_only = 0;
 		both = 1;
 		break;
+	case FAT_IOCTL_SET_VOLUME_LABEL32:
+		return fat_ioctl_set_volume_label(filp, arg);
 	default:
 		return fat_generic_ioctl(filp, cmd, (unsigned long)arg);
 	}
