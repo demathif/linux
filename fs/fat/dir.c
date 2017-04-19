@@ -848,7 +848,7 @@ static int msdos_update_volume_label(struct inode *dir,
 	struct inode *inode;
 	__le16 time, date;
 
-	fat_msg(sb, KERN_INFO, "%s: %s\n", __func__, name);
+	fat_msg(sb, KERN_INFO, "%s: %s", __func__, name);
 	fat_time_unix2fat(sbi, ts, &time, &date, NULL);
 	memcpy(sinfo->de->name, name, MSDOS_NAME);
 	inode = fat_build_inode(sb, sinfo->de, sinfo->i_pos);
@@ -913,10 +913,28 @@ static int fat_ioctl_set_volume_label(struct file *filp, unsigned long arg)
 		memcpy(b->fat32.vol_label, label, MSDOS_NAME);
 	else
 		memcpy(b->fat16.vol_label, label, MSDOS_NAME);
+	fat_msg(sb, KERN_INFO, "update boot sector, fat%d", sbi->fat_bits);
 
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 	brelse(bh);
+
+	/* Backup for FAT32 */
+	if (sbi->fat_bits == 32) {
+		struct buffer_head *bh_backup;
+		struct fat_boot_sector *b_backup;
+
+		bh_backup = sb_bread(sb, b->fat32.backup_boot);
+		if (bh_backup) {
+			b_backup = (struct fat_boot_sector *) bh_backup->b_data;
+			memcpy(b_backup->fat32.vol_label, label, MSDOS_NAME);
+			fat_msg(sb, KERN_INFO, "update backup boot sector, fat%d", sbi->fat_bits);
+
+			mark_buffer_dirty(bh_backup);
+			sync_dirty_buffer(bh_backup);
+			brelse(bh_backup);
+		}
+	}
 
 	return 0;
 }
